@@ -8,6 +8,7 @@ nonebot.init()
 driver = nonebot.get_driver()
 driver.register_adapter(OneBotV11Adapter)
 nonebot.load_plugin("plugins.auto_reply")
+nonebot.load_plugin("plugins.status_notify")
 
 
 if __name__ == "__main__":

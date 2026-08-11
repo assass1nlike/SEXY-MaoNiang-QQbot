@@ -46,6 +46,7 @@ SYSTEM_PROMPT = os.getenv(
     "你是一个友善、简洁的 QQ 群助手。请直接回答用户的问题。",
 )
 PUBLIC_SYSTEM_PROMPT = os.getenv("PUBLIC_SYSTEM_PROMPT", "").strip() or SYSTEM_PROMPT
+RATING_SYSTEM_PROMPT = os.getenv("RATING_SYSTEM_PROMPT", "").strip()
 PREFILL_USER = os.getenv("PREFILL_USER", "").strip()
 PREFILL_ASSISTANT = os.getenv("PREFILL_ASSISTANT", "").strip()
 PUBLIC_PREFILL_USER = os.getenv("PUBLIC_PREFILL_USER", "").strip()
@@ -183,6 +184,17 @@ def _prefill_for(is_public: bool) -> tuple[str, str]:
     return PREFILL_USER, PREFILL_ASSISTANT
 
 
+def _private_command_for(prompt: str, is_public: bool) -> str | None:
+    """Recognize exact private-only commands after the bot mention is removed."""
+    if is_public:
+        return None
+    if prompt == "清空":
+        return "clear"
+    if prompt == "评分":
+        return "rating"
+    return None
+
+
 def _history_for(key: ConversationKey) -> deque[MessageItem]:
     history = _conversation_histories.get(key)
     if history is None:
@@ -199,6 +211,10 @@ def _remember_turn(key: ConversationKey, prompt: str, answer: str) -> None:
             {"role": "assistant", "content": answer},
         ]
     )
+
+
+def _clear_private_history(key: ConversationKey) -> None:
+    _conversation_histories.pop(key, None)
 
 
 def _public_history_for(group_id: int) -> deque[MessageItem]:
@@ -265,6 +281,7 @@ async def handle_group_message(event: GroupMessageEvent) -> None:
     prompt = public_prompt if is_public else raw_prompt.strip()
     if not prompt:
         return
+    command = _private_command_for(prompt, is_public)
     prompt = prompt[:MAX_MESSAGE_LENGTH]
     if is_public:
         prompt = _format_public_prompt(event, prompt)
@@ -276,6 +293,16 @@ async def handle_group_message(event: GroupMessageEvent) -> None:
         key = (event.group_id, event.user_id)
         lock = _conversation_locks.setdefault(key, asyncio.Lock())
 
+    if command == "clear":
+        assert key is not None
+        async with lock:
+            _clear_private_history(key)
+        await auto_reply.finish(
+            MessageSegment.reply(event.message_id) + "上下文已清空。"
+        )
+        return
+
+    is_rating = command == "rating"
     async with lock:
         # Re-read after acquiring the lock because another message may have
         # completed while this one was waiting.
@@ -286,10 +313,17 @@ async def handle_group_message(event: GroupMessageEvent) -> None:
             history = list(_history_for(key))
         try:
             prefill_user, prefill_assistant = _prefill_for(is_public)
+            instructions = (
+                RATING_SYSTEM_PROMPT
+                if is_rating
+                else _instructions_for(is_public)
+            )
+            if is_rating and not instructions:
+                raise RuntimeError("RATING_SYSTEM_PROMPT is not configured")
             answer = await _ask_api(
                 prompt,
                 history,
-                instructions=_instructions_for(is_public),
+                instructions=instructions,
                 prefill_user=prefill_user,
                 prefill_assistant=prefill_assistant,
             )
@@ -304,10 +338,16 @@ async def handle_group_message(event: GroupMessageEvent) -> None:
             )
             answer = "我暂时无法处理这条消息，请检查机器人配置或稍后再试。"
         else:
-            if is_public:
+            if is_rating:
+                pass
+            elif is_public:
                 _remember_public_turn(event.group_id, prompt, answer)
             else:
                 assert key is not None
                 _remember_turn(key, prompt, answer)
+        finally:
+            if is_rating:
+                assert key is not None
+                _clear_private_history(key)
 
     await auto_reply.finish(MessageSegment.reply(event.message_id) + answer)
